@@ -1,24 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getUserByTelegramId, recordPurchase } from "@/lib/bot/helpers";
+import { recordPurchase, getUserByTelegramId, logAction } from "@/lib/bot/helpers";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
-  try {
-    const { buyerTelegramId, amount, description } = await req.json();
+  const body = await req.json();
+  const { buyerTelegramId, amount, description } = body;
 
-    if (!buyerTelegramId || !amount || amount <= 0) {
-      return NextResponse.json({ ok: false, error: "Неверные параметры" }, { status: 400 });
-    }
-
-    const buyer = await getUserByTelegramId(buyerTelegramId);
-    if (!buyer) {
-      return NextResponse.json({ ok: false, error: "Пользователь не найден" }, { status: 404 });
-    }
-
-    const result = await recordPurchase(buyerTelegramId, amount, description);
-    return NextResponse.json({ ok: true, ...result });
-  } catch (err) {
-    return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
+  if (!buyerTelegramId || !amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+    return NextResponse.json({ error: "Invalid params" }, { status: 400 });
   }
+
+  const buyer = await getUserByTelegramId(Number(buyerTelegramId));
+  if (!buyer) {
+    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  }
+
+  const result = await recordPurchase(Number(buyerTelegramId), Number(amount), description);
+  await logAction(null, "web_admin", "PURCHASE_RECORDED", `buyer=${buyerTelegramId} amount=${amount}`);
+
+  return NextResponse.json({ ok: true, ...result });
 }

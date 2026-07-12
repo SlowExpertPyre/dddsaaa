@@ -20,7 +20,7 @@ export const users = pgTable(
     username: text("username"),
     firstName: text("first_name"),
     lastName: text("last_name"),
-    referredBy: bigint("referred_by", { mode: "number" }), // telegram_id реферера
+    referredBy: bigint("referred_by", { mode: "number" }),
     isAdmin: boolean("is_admin").default(false).notNull(),
     joinedAt: timestamp("joined_at").defaultNow().notNull(),
   },
@@ -51,15 +51,28 @@ export const products = pgTable("products", {
   name: text("name").notNull(),
   description: text("description"),
   price: numeric("price", { precision: 12, scale: 2 }).notNull(),
-  // Тип товара: "invite_link" (одноразовая ссылка в канал) | "digital" (текст/файл)
   productType: text("product_type").default("invite_link").notNull(),
-  // Для типа invite_link: ID канала/группы Telegram
   channelId: text("channel_id"),
-  // Для типа digital: цифровой контент (текст)
   digitalContent: text("digital_content"),
   isActive: boolean("is_active").default(true).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
+// Купоны/скидки
+export const coupons = pgTable(
+  "coupons",
+  {
+    id: serial("id").primaryKey(),
+    code: text("code").notNull().unique(),
+    discountPercent: integer("discount_percent").notNull(),
+    usageLimit: integer("usage_limit").default(0).notNull(), // 0 = unlimited
+    usageCount: integer("usage_count").default(0).notNull(),
+    isActive: boolean("is_active").default(true).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at"),
+  },
+  (t) => [index("coupons_code_idx").on(t.code)]
+);
 
 // Заказы / оплаты
 export const orders = pgTable(
@@ -71,15 +84,14 @@ export const orders = pgTable(
     productId: integer("product_id").notNull(),
     amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
     commission: numeric("commission", { precision: 12, scale: 2 }).notNull(),
-    // Метод оплаты: "sbp" | "cryptobot" | "stars_username" | "stars_gift"
+    couponCode: text("coupon_code"),
+    discountPercent: integer("discount_percent").default(0).notNull(),
+    // Метод оплаты: "sbp" | "card" | "cryptobot" | "stars_username" | "stars_gift"
     paymentMethod: text("payment_method").notNull(),
     // Статус: "pending" | "paid" | "failed" | "cancelled"
     status: text("status").default("pending").notNull(),
-    // Внешний ID платежа (от платёжной системы)
     externalPaymentId: text("external_payment_id"),
-    // Данные от платёжной системы (JSON)
     paymentData: jsonb("payment_data"),
-    // Выданная ссылка после оплаты
     deliveredLink: text("delivered_link"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     paidAt: timestamp("paid_at"),
