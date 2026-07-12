@@ -8,9 +8,8 @@ import {
   orders,
   products,
   userStates,
-  coupons,
 } from "@/db/schema";
-import { eq, sql, desc, and } from "drizzle-orm";
+import { eq, sql, desc } from "drizzle-orm";
 
 // ─── Пользователи ────────────────────────────────────────────────────────────
 
@@ -28,6 +27,7 @@ export async function getOrCreateUser(
     .limit(1);
 
   if (existing.length > 0) {
+    // обновим имя если изменилось
     await db
       .update(users)
       .set({ username, firstName, lastName })
@@ -129,7 +129,7 @@ export async function getProductById(id: number) {
 
 export async function createProduct(data: {
   name: string;
-  description?: string | null;
+  description?: string;
   price: number;
   productType: string;
   channelId?: string;
@@ -139,7 +139,7 @@ export async function createProduct(data: {
     .insert(products)
     .values({
       name: data.name,
-      description: data.description ?? null,
+      description: data.description,
       price: data.price.toString(),
       productType: data.productType,
       channelId: data.channelId,
@@ -177,67 +177,6 @@ export async function deleteProduct(id: number) {
   await db.update(products).set({ isActive: false }).where(eq(products.id, id));
 }
 
-// ─── Купоны ──────────────────────────────────────────────────────────────────
-
-export async function getCouponByCode(code: string) {
-  const rows = await db
-    .select()
-    .from(coupons)
-    .where(eq(coupons.code, code.toUpperCase()))
-    .limit(1);
-  return rows[0] ?? null;
-}
-
-export async function validateCoupon(code: string): Promise<{
-  valid: boolean;
-  coupon?: typeof coupons.$inferSelect;
-  error?: string;
-}> {
-  const coupon = await getCouponByCode(code);
-  if (!coupon) return { valid: false, error: "Купон не найден" };
-  if (!coupon.isActive) return { valid: false, error: "Купон деактивирован" };
-  if (coupon.expiresAt && new Date() > coupon.expiresAt) {
-    return { valid: false, error: "Купон истёк" };
-  }
-  if (coupon.usageLimit > 0 && coupon.usageCount >= coupon.usageLimit) {
-    return { valid: false, error: "Купон исчерпан" };
-  }
-  return { valid: true, coupon };
-}
-
-export async function useCoupon(code: string) {
-  await db
-    .update(coupons)
-    .set({ usageCount: sql`${coupons.usageCount} + 1` })
-    .where(eq(coupons.code, code.toUpperCase()));
-}
-
-export async function createCoupon(data: {
-  code: string;
-  discountPercent: number;
-  usageLimit?: number;
-  expiresAt?: Date;
-}) {
-  const [c] = await db
-    .insert(coupons)
-    .values({
-      code: data.code.toUpperCase(),
-      discountPercent: data.discountPercent,
-      usageLimit: data.usageLimit ?? 0,
-      expiresAt: data.expiresAt,
-    })
-    .returning();
-  return c;
-}
-
-export async function getAllCoupons() {
-  return db.select().from(coupons).orderBy(desc(coupons.createdAt));
-}
-
-export async function deactivateCoupon(id: number) {
-  await db.update(coupons).set({ isActive: false }).where(eq(coupons.id, id));
-}
-
 // ─── Заказы ──────────────────────────────────────────────────────────────────
 
 export async function createOrder(data: {
@@ -246,13 +185,10 @@ export async function createOrder(data: {
   amount: number;
   paymentMethod: string;
   externalPaymentId?: string;
-  couponCode?: string;
-  discountPercent?: number;
 }) {
   const buyer = await getUserByTelegramId(data.buyerTelegramId);
   const referrerTelegramId = buyer?.referredBy ?? null;
-  // Комиссия 10% от суммы
-  const commission = +(data.amount * 0.1).toFixed(2);
+  const commission = +(data.amount * 0.5).toFixed(2);
 
   const [order] = await db
     .insert(orders)
@@ -265,8 +201,6 @@ export async function createOrder(data: {
       paymentMethod: data.paymentMethod,
       status: "pending",
       externalPaymentId: data.externalPaymentId,
-      couponCode: data.couponCode,
-      discountPercent: data.discountPercent ?? 0,
     })
     .returning();
   return order;
@@ -286,7 +220,10 @@ export async function getOrderById(id: number) {
   return rows[0] ?? null;
 }
 
-export async function markOrderPaid(orderId: number, deliveredLink?: string) {
+export async function markOrderPaid(
+  orderId: number,
+  deliveredLink?: string
+) {
   await db
     .update(orders)
     .set({
@@ -310,8 +247,7 @@ export async function recordPurchase(
 ) {
   const buyer = await getUserByTelegramId(buyerTelegramId);
   const referrerTelegramId = buyer?.referredBy ?? null;
-  // Реферальная комиссия: 10% от суммы
-  const commission = +(amount * 0.1).toFixed(2);
+  const commission = +(amount * 0.5).toFixed(2);
 
   const [purchase] = await db
     .insert(purchases)
@@ -397,48 +333,6 @@ export async function getRecentPurchases(limit = 20) {
   return db.select().from(purchases).orderBy(desc(purchases.createdAt)).limit(limit);
 }
 
-// ─── Детальная статистика пользователя (для /users/:id) ─────────────────────
-
-export async function getUserDetailedStats(telegramId: number) {
-  const user = await getUserByTelegramId(telegramId);
-  if (!user) return null;
-
-  const link = await getReferralLink(telegramId);
-  const earned = await getEarningsByTelegramId(telegramId);
-
-  // Покупки, сделанные через реферальную ссылку этого пользователя
-  const [refPurchaseStats] = await db.select({
-    count: sql<number>`count(*)::int`,
-    total: sql<string>`coalesce(sum(amount),0)::text`,
-  }).from(purchases).where(eq(purchases.referrerTelegramId, telegramId));
-
-  // Покупки, сделанные самим пользователем
-  const [ownPurchaseStats] = await db.select({
-    count: sql<number>`count(*)::int`,
-    total: sql<string>`coalesce(sum(amount),0)::text`,
-  }).from(purchases).where(eq(purchases.buyerTelegramId, telegramId));
-
-  // Оплаченные заказы самого пользователя
-  const [ownOrderStats] = await db.select({
-    count: sql<number>`count(*)::int`,
-    total: sql<string>`coalesce(sum(amount),0)::text`,
-  }).from(orders).where(
-    and(eq(orders.buyerTelegramId, telegramId), eq(orders.status, "paid"))
-  );
-
-  return {
-    user,
-    link,
-    totalEarned: earned?.totalEarned ?? "0",
-    refPurchases: refPurchaseStats.count,
-    refRevenue: refPurchaseStats.total,
-    ownPurchases: ownPurchaseStats.count,
-    ownSpent: ownPurchaseStats.total,
-    ownOrders: ownOrderStats.count,
-    ownOrdersTotal: ownOrderStats.total,
-  };
-}
-
 // ─── Состояние FSM ───────────────────────────────────────────────────────────
 
 export async function getUserState(telegramId: number) {
@@ -513,13 +407,18 @@ export function displayName(
 }
 
 // ─── Расчёт звёзд ────────────────────────────────────────────────────────────
+// Комиссия Fragment: ~7%
+// Комиссия Telegram при конвертации подарков в звёзды: ~30%
+// Итого при оплате подарками: делим сумму на курс звезды и добавляем обе комиссии
 
 export function calcStarsByUsername(
   amountRub: number,
   fragmentRateRubPerStar: number
 ): number {
+  // Оплата по юзернейму через Fragment: только комиссия Fragment ~7%
   const starsRaw = amountRub / fragmentRateRubPerStar;
-  const starsWithFee = starsRaw * 1.07;
+  const starsWithFee = starsRaw * 1.07; // +7% комиссия Fragment
+  // Округляем вниз до кратного 50
   return Math.floor(starsWithFee / 50) * 50;
 }
 
@@ -527,15 +426,10 @@ export function calcStarsByGift(
   amountRub: number,
   fragmentRateRubPerStar: number
 ): number {
-  // 1400 звёзд фиксированно для подарка (как указано в задании)
-  // Но также считаем динамически
+  // Оплата подарками: комиссия Fragment ~7% + комиссия ТГ при конвертации подарков в звёзды ~30%
+  // Общая: multiply by 1/((1-0.07)*(1-0.30)) = 1/(0.93*0.70) ≈ 1.537
   const starsRaw = amountRub / fragmentRateRubPerStar;
-  const starsWithFees = starsRaw * (1 / (0.93 * 0.70));
+  const starsWithFees = starsRaw * (1 / (0.93 * 0.70)); // обе комиссии
+  // Округляем вниз до кратного 50
   return Math.floor(starsWithFees / 50) * 50;
-}
-
-// ─── Расчёт суммы с комиссией 10% для Platega ────────────────────────────────
-
-export function calcAmountWithCommission(baseAmount: number): number {
-  return +(baseAmount * 1.1).toFixed(2);
 }

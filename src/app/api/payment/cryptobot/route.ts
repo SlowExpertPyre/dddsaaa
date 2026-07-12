@@ -9,8 +9,10 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
 
-    // Верификация подписи CryptoBot
+    // Верификация: проверяем секрет CryptoBot через заголовок
     const cryptoBotToken = process.env.CRYPTOBOT_TOKEN ?? "";
+
+    // Проверка подписи (crypto-pay-api-signature header)
     const signature = req.headers.get("crypto-pay-api-signature");
     if (cryptoBotToken && signature) {
       const crypto = await import("crypto");
@@ -24,6 +26,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Обрабатываем событие
     if (body.update_type === "invoice_paid") {
       const invoice = body.payload;
       const invoiceId = String(invoice.invoice_id);
@@ -31,10 +34,12 @@ export async function POST(req: NextRequest) {
 
       let orderId: number | null = null;
 
+      // Сначала пробуем найти по payload
       if (payload && payload.startsWith("order_")) {
         orderId = parseInt(payload.replace("order_", ""));
       }
 
+      // Если не нашли — ищем по invoice_id
       if (!orderId) {
         const order = await getOrderByExternalId(invoiceId);
         if (order) orderId = order.id;
@@ -42,9 +47,10 @@ export async function POST(req: NextRequest) {
 
       if (!orderId) {
         console.error("CryptoBot webhook: заказ не найден для invoice", invoiceId);
-        return NextResponse.json({ ok: true });
+        return NextResponse.json({ ok: true }); // Возвращаем ok чтобы не получать retry
       }
 
+      // Получаем заказ из БД
       const { db } = await import("@/db");
       const { orders } = await import("@/db/schema");
       const { eq } = await import("drizzle-orm");
@@ -56,9 +62,13 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
 
+      // Создаём фиктивный контекст для deliverOrder
       const bot = createBot();
       if (!bot) return NextResponse.json({ ok: true });
 
+      // Выдаём товар напрямую
+      const { deliverOrder } = await import("@/lib/bot/bot");
+      // deliverOrder требует ctx — используем Telegram API напрямую
       await processOrderDelivery(orderId, order.buyerTelegramId, bot);
     }
 
@@ -73,21 +83,12 @@ export async function GET() {
   return NextResponse.json({ ok: true, message: "CryptoBot webhook активен" });
 }
 
-async function processOrderDelivery(
-  orderId: number,
-  buyerTelegramId: number,
-  bot: NonNullable<ReturnType<typeof createBot>>
-) {
+// Выдача заказа без ctx (через прямые Telegram API вызовы)
+async function processOrderDelivery(orderId: number, buyerTelegramId: number, bot: NonNullable<ReturnType<typeof createBot>>) {
   const { db } = await import("@/db");
   const { orders } = await import("@/db/schema");
   const { eq } = await import("drizzle-orm");
-  const {
-    getProductById,
-    markOrderPaid,
-    recordPurchase,
-    getUserByTelegramId,
-    formatMoney,
-  } = await import("@/lib/bot/helpers");
+  const { getProductById, markOrderPaid, recordPurchase, getUserByTelegramId, displayName, formatMoney } = await import("@/lib/bot/helpers");
 
   const orderRows = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
   const order = orderRows[0];
@@ -120,18 +121,18 @@ async function processOrderDelivery(
     if (product.productType === "invite_link") {
       await bot.telegram.sendMessage(
         buyerTelegramId,
-        `✅ <b>Оплата CryptoBot подтверждена!</b>\n\n` +
-          `📦 Товар: <b>${product.name}</b>\n\n` +
-          `🔗 Ваша одноразовая ссылка:\n${deliveredContent}\n\n` +
-          `⚠️ Ссылка одноразовая — не передавайте её!`,
+        `✅ <b>Оплата подтверждена!</b>\n\n` +
+        `📦 Товар: <b>${product.name}</b>\n\n` +
+        `🔗 Ваша одноразовая ссылка:\n${deliveredContent}\n\n` +
+        `⚠️ Ссылка одноразовая — не передавайте её другим!`,
         { parse_mode: "HTML" }
       );
     } else {
       await bot.telegram.sendMessage(
         buyerTelegramId,
-        `✅ <b>Оплата CryptoBot подтверждена!</b>\n\n` +
-          `📦 Товар: <b>${product.name}</b>\n\n` +
-          `📋 <b>Ваш контент:</b>\n${deliveredContent}`,
+        `✅ <b>Оплата подтверждена!</b>\n\n` +
+        `📦 Товар: <b>${product.name}</b>\n\n` +
+        `📋 <b>Ваш контент:</b>\n${deliveredContent}`,
         { parse_mode: "HTML" }
       );
     }
@@ -139,16 +140,17 @@ async function processOrderDelivery(
     console.error("Ошибка отправки товара:", e);
   }
 
+  // Реферальное уведомление
   const buyer = await getUserByTelegramId(buyerTelegramId);
   if (buyer?.referredBy) {
-    const commission = parseFloat(order.amount) * 0.1;
+    const commission = parseFloat(order.amount) * 0.5;
     try {
       await bot.telegram.sendMessage(
         buyer.referredBy,
-        `🎉 <b>Реферальная комиссия!</b>\n\n` +
-          `Ваш реферал купил «${product.name}».\n` +
-          `💰 Ваша комиссия (10%): <b>${formatMoney(commission)}</b>\n\n` +
-          `/mystats — ваш заработок`,
+        `🎉 <b>Вы получили комиссию!</b>\n\n` +
+        `Ваш реферал купил «${product.name}».\n` +
+        `💰 Ваша комиссия (50%): <b>${formatMoney(commission)}</b>\n\n` +
+        `/mystats — ваш заработок`,
         { parse_mode: "HTML" }
       );
     } catch {

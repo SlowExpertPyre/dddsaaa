@@ -27,13 +27,6 @@ import {
   clearUserState,
   calcStarsByUsername,
   calcStarsByGift,
-  calcAmountWithCommission,
-  validateCoupon,
-  useCoupon,
-  createCoupon,
-  getAllCoupons,
-  deactivateCoupon,
-  getUserDetailedStats,
 } from "./helpers";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
@@ -43,20 +36,18 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS ?? "")
   .filter((n) => !isNaN(n) && n > 0);
 const BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME ?? "myrefbot";
 
-// Звёзды: юзернейм для получения
+// Юзернейм/ID аккаунта куда слать звёзды (настраивается через конфиг)
 const STARS_RECIPIENT_USERNAME = process.env.STARS_RECIPIENT_USERNAME ?? "";
-// Курс Fragment: сколько рублей стоит 1 звезда
+// Курс Fragment: сколько рублей стоит 1 звезда (по умолчанию ~1.12 ₽)
 const FRAGMENT_RATE = parseFloat(process.env.FRAGMENT_RATE_RUB ?? "1.12");
-// Фиксированное кол-во звёзд для подарка
-const GIFT_STARS_AMOUNT = parseInt(process.env.GIFT_STARS_AMOUNT ?? "1400");
 
 // CryptoBot
 const CRYPTOBOT_TOKEN = process.env.CRYPTOBOT_TOKEN ?? "";
 const CRYPTOBOT_API = "https://pay.crypt.bot/api";
 
-// Platega (СБП + карта)
-const PLATEGA_MERCHANT_ID = process.env.PLATEGA_MERCHANT_ID ?? "";
-const PLATEGA_SECRET_KEY = process.env.PLATEGA_SECRET_KEY ?? "";
+// Плати (SBP)
+const PLATIKA_SHOP_ID = process.env.PLATIKA_SHOP_ID ?? "";
+const PLATIKA_SECRET_KEY = process.env.PLATIKA_SECRET_KEY ?? "";
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL ?? "";
 
 function isAdmin(telegramId: number): boolean {
@@ -95,62 +86,40 @@ async function createCryptoBotInvoice(
   }
 }
 
-// ─── Platega (СБП + карта) helpers ───────────────────────────────────────────
+// ─── Плати (СБП) helpers ─────────────────────────────────────────────────────
 
-async function createPlategalInvoice(
+async function createPlatikaSBPInvoice(
   amount: number,
   orderId: string,
-  description: string,
-  paymentMethod: "sbp" | "card"
+  description: string
 ): Promise<{ paymentUrl: string; paymentId: string } | null> {
-  if (!PLATEGA_MERCHANT_ID || !PLATEGA_SECRET_KEY) return null;
+  if (!PLATIKA_SHOP_ID || !PLATIKA_SECRET_KEY) return null;
   try {
-    // Platega API: создаём транзакцию
-    // payment_method: 1 = card, 2 = SBP
-    const methodId = paymentMethod === "sbp" ? 2 : 1;
-    const { v4: uuidv4 } = await import("uuid");
-    const txId = uuidv4();
-
-    const body = {
-      id: txId,
-      merchant_id: PLATEGA_MERCHANT_ID,
-      payment_method: methodId,
-      payment_details: {
-        amount: amount,
-        currency: "RUB",
-      },
-      description: description,
-      return_url: `https://t.me/${BOT_USERNAME}`,
-      failed_url: `https://t.me/${BOT_USERNAME}`,
-      webhook_url: `${WEBHOOK_BASE_URL}/api/payment/platega`,
-      order_id: orderId,
-    };
-
-    const crypto = await import("crypto");
-    // Подпись HMAC-SHA256
-    const sign = crypto
-      .createHmac("sha256", PLATEGA_SECRET_KEY)
-      .update(JSON.stringify(body))
-      .digest("hex");
-
     const res = await axios.post(
-      "https://api.platega.io/v1/transaction/create",
-      body,
+      "https://api.platika.ru/v1/payment/create",
+      {
+        shop_id: PLATIKA_SHOP_ID,
+        amount: Math.round(amount * 100), // в копейках
+        order_id: orderId,
+        description,
+        payment_method: "sbp",
+        callback_url: `${WEBHOOK_BASE_URL}/api/payment/sbp`,
+        success_url: `https://t.me/${BOT_USERNAME}`,
+        fail_url: `https://t.me/${BOT_USERNAME}`,
+      },
       {
         headers: {
+          "X-Api-Key": PLATIKA_SECRET_KEY,
           "Content-Type": "application/json",
-          "X-Merchant-ID": PLATEGA_MERCHANT_ID,
-          "X-Signature": sign,
         },
       }
     );
-
     return {
-      paymentUrl: res.data.redirect ?? res.data.payment_url ?? res.data.url ?? "",
-      paymentId: txId,
+      paymentUrl: res.data.payment_url,
+      paymentId: res.data.payment_id,
     };
   } catch (e) {
-    console.error("Platega error:", e);
+    console.error("Platika SBP error:", e);
     return null;
   }
 }
@@ -185,7 +154,7 @@ export function createBot() {
     const msg =
       `👋 Привет, <b>${first_name}</b>!\n\n` +
       `🔗 Ваша реферальная ссылка:\n<code>${refUrl}</code>\n\n` +
-      `📢 Делитесь ссылкой и получайте <b>10% комиссии</b> с каждой покупки ваших рефералов!\n\n` +
+      `📢 Делитесь ссылкой и получайте <b>50% комиссии</b> с каждой покупки ваших рефералов!\n\n` +
       `📋 Команды:\n` +
       `/shop — 🛒 Магазин товаров\n` +
       `/mylink — 🔗 Ваша реферальная ссылка\n` +
@@ -252,26 +221,19 @@ export function createBot() {
       return;
     }
 
-    const starsUsername = calcStarsByUsername(parseFloat(product.price), FRAGMENT_RATE);
-    const starsGift = GIFT_STARS_AMOUNT;
-
     const text =
       `📦 <b>${product.name}</b>\n\n` +
       (product.description ? `📝 ${product.description}\n\n` : "") +
       `💰 Цена: <b>${formatMoney(product.price)}</b>\n\n` +
-      `⭐ Stars (по юзернейму): ~<b>${starsUsername} ⭐</b>\n` +
-      `🎁 Stars (подарком): <b>${starsGift} ⭐</b>\n\n` +
       `Выберите способ оплаты:`;
 
     await ctx.replyWithHTML(
       text,
       Markup.inlineKeyboard([
-        [Markup.button.callback("💳 СБП (+10% комиссия)", `pay_sbp_${productId}`)],
-        [Markup.button.callback("🏦 Банковская карта (+10%)", `pay_card_${productId}`)],
+        [Markup.button.callback("💳 СБП (Плати)", `pay_sbp_${productId}`)],
         [Markup.button.callback("🪙 CryptoBot (USDT)", `pay_crypto_${productId}`)],
         [Markup.button.callback("⭐ Звёзды по юзернейму", `pay_stars_username_${productId}`)],
-        [Markup.button.callback("🎁 Звёзды подарком (1400 ⭐)", `pay_stars_gift_${productId}`)],
-        [Markup.button.callback("🏷 Применить купон", `coupon_${productId}`)],
+        [Markup.button.callback("🎁 Оплата подарками (Stars)", `pay_stars_gift_${productId}`)],
         [Markup.button.callback("◀️ Назад", "back_to_shop")],
       ])
     );
@@ -297,62 +259,125 @@ export function createBot() {
     );
   });
 
-  // ─── Применение купона ───────────────────────────────────────────────────
-  bot.action(/^coupon_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const { id } = ctx.from;
-
-    await setUserState(id, "apply_coupon", { productId });
-    await ctx.reply(
-      "🏷 Введите код купона:\n\n(Купон применяется к базовой цене товара)"
-    );
-  });
-
   // ─── Оплата СБП ──────────────────────────────────────────────────────────
   bot.action(/^pay_sbp_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    await initiatePayment(ctx, productId, "sbp");
-  });
+    const product = await getProductById(productId);
+    if (!product) return;
 
-  // ─── Оплата Карта ────────────────────────────────────────────────────────
-  bot.action(/^pay_card_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    await initiatePayment(ctx, productId, "card");
-  });
+    const { id: telegramId, username, first_name } = ctx.from;
+    await getOrCreateUser(telegramId, username, first_name);
 
-  // ─── Оплата СБП с купоном ────────────────────────────────────────────────
-  bot.action(/^pay_sbp_coupon_(\d+)_(.+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const couponCode = (ctx.match as RegExpMatchArray)[2];
-    await initiatePayment(ctx, productId, "sbp", couponCode);
-  });
+    const amount = parseFloat(product.price);
+    const order = await createOrder({
+      buyerTelegramId: telegramId,
+      productId,
+      amount,
+      paymentMethod: "sbp",
+    });
 
-  bot.action(/^pay_card_coupon_(\d+)_(.+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const couponCode = (ctx.match as RegExpMatchArray)[2];
-    await initiatePayment(ctx, productId, "card", couponCode);
-  });
+    if (!PLATIKA_SHOP_ID) {
+      await ctx.replyWithHTML(
+        `💳 <b>Оплата через СБП</b>\n\n` +
+        `Товар: <b>${product.name}</b>\n` +
+        `Сумма: <b>${formatMoney(amount)}</b>\n\n` +
+        `⚠️ СБП пока не настроен. Обратитесь к администратору.\n` +
+        `ID заказа: <code>${order.id}</code>`
+      );
+      return;
+    }
 
-  bot.action(/^pay_crypto_coupon_(\d+)_(.+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const couponCode = (ctx.match as RegExpMatchArray)[2];
-    await initiatePayment(ctx, productId, "cryptobot", couponCode);
+    const invoice = await createPlatikaSBPInvoice(
+      amount,
+      `order_${order.id}`,
+      `Оплата товара: ${product.name}`
+    );
+
+    if (!invoice) {
+      await ctx.reply("❌ Ошибка создания платежа. Попробуйте позже.");
+      return;
+    }
+
+    // Сохраним external ID
+    const { db } = await import("@/db");
+    const { orders: ordersTable } = await import("@/db/schema");
+    const { eq } = await import("drizzle-orm");
+    await db.update(ordersTable).set({ externalPaymentId: invoice.paymentId }).where(eq(ordersTable.id, order.id));
+
+    await ctx.replyWithHTML(
+      `💳 <b>Оплата через СБП</b>\n\n` +
+      `Товар: <b>${product.name}</b>\n` +
+      `Сумма: <b>${formatMoney(amount)}</b>\n\n` +
+      `Нажмите кнопку ниже для оплаты:`,
+      Markup.inlineKeyboard([
+        [Markup.button.url("💳 Оплатить через СБП", invoice.paymentUrl)],
+      ])
+    );
   });
 
   // ─── Оплата CryptoBot ────────────────────────────────────────────────────
   bot.action(/^pay_crypto_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    await initiatePayment(ctx, productId, "cryptobot");
+    const product = await getProductById(productId);
+    if (!product) return;
+
+    const { id: telegramId, username, first_name } = ctx.from;
+    await getOrCreateUser(telegramId, username, first_name);
+
+    const amountRub = parseFloat(product.price);
+    const order = await createOrder({
+      buyerTelegramId: telegramId,
+      productId,
+      amount: amountRub,
+      paymentMethod: "cryptobot",
+    });
+
+    if (!CRYPTOBOT_TOKEN) {
+      await ctx.replyWithHTML(
+        `🪙 <b>Оплата через CryptoBot</b>\n\n` +
+        `Товар: <b>${product.name}</b>\n` +
+        `Сумма: <b>${formatMoney(amountRub)}</b>\n\n` +
+        `⚠️ CryptoBot пока не настроен. Обратитесь к администратору.\n` +
+        `ID заказа: <code>${order.id}</code>`
+      );
+      return;
+    }
+
+    // Конвертируем рубли в USDT (примерно, нужно настроить курс)
+    const usdRate = parseFloat(process.env.USD_TO_RUB_RATE ?? "90");
+    const amountUSDT = +(amountRub / usdRate).toFixed(2);
+
+    const invoice = await createCryptoBotInvoice(
+      amountUSDT,
+      "USDT",
+      `Оплата: ${product.name}`,
+      `order_${order.id}`
+    );
+
+    if (!invoice) {
+      await ctx.reply("❌ Ошибка создания платежа. Попробуйте позже.");
+      return;
+    }
+
+    const { db } = await import("@/db");
+    const { orders: ordersTable } = await import("@/db/schema");
+    const { eq } = await import("drizzle-orm");
+    await db.update(ordersTable).set({ externalPaymentId: invoice.invoiceId }).where(eq(ordersTable.id, order.id));
+
+    await ctx.replyWithHTML(
+      `🪙 <b>Оплата через CryptoBot</b>\n\n` +
+      `Товар: <b>${product.name}</b>\n` +
+      `Сумма: <b>${amountUSDT} USDT</b> (~${formatMoney(amountRub)})\n\n` +
+      `Нажмите кнопку для оплаты:`,
+      Markup.inlineKeyboard([
+        [Markup.button.url("🪙 Оплатить в CryptoBot", invoice.invoiceUrl)],
+      ])
+    );
   });
 
-  // ─── Оплата Stars — по юзернейму ─────────────────────────────────────────
+  // ─── Оплата Stars по юзернейму (Fragment) ────────────────────────────────
   bot.action(/^pay_stars_username_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
@@ -362,35 +387,42 @@ export function createBot() {
     const { id: telegramId, username, first_name } = ctx.from;
     await getOrCreateUser(telegramId, username, first_name);
 
-    const amount = parseFloat(product.price);
-    const starsNeeded = calcStarsByUsername(amount, FRAGMENT_RATE);
+    const amountRub = parseFloat(product.price);
+    const starsNeeded = calcStarsByUsername(amountRub, FRAGMENT_RATE);
 
     const order = await createOrder({
       buyerTelegramId: telegramId,
       productId,
-      amount,
+      amount: amountRub,
       paymentMethod: "stars_username",
     });
 
-    const recipient = STARS_RECIPIENT_USERNAME || "username_not_set";
+    const recipient = STARS_RECIPIENT_USERNAME || "администратору";
 
     await ctx.replyWithHTML(
       `⭐ <b>Оплата звёздами (по юзернейму)</b>\n\n` +
-      `📦 Товар: <b>${product.name}</b>\n` +
-      `💰 Базовая сумма: <b>${formatMoney(amount)}</b>\n` +
-      `⭐ Звёзд к отправке: <b>${starsNeeded} ⭐</b>\n\n` +
-      `📨 Отправьте <b>${starsNeeded} ⭐</b> пользователю:\n` +
-      `<code>@${recipient}</code>\n\n` +
-      `❗ В комментарии к оплате укажите ID заказа: <code>${order.id}</code>\n\n` +
-      `После отправки нажмите кнопку ниже:`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback("✅ Я отправил звёзды", `stars_sent_${order.id}`)],
-        [Markup.button.callback("❌ Отмена", "back_to_shop")],
-      ])
+      `Товар: <b>${product.name}</b>\n` +
+      `Цена: <b>${formatMoney(amountRub)}</b>\n\n` +
+      `📊 Расчёт:\n` +
+      `• Курс Fragment: <b>${FRAGMENT_RATE} ₽/⭐</b>\n` +
+      `• Комиссия Fragment: <b>7%</b>\n` +
+      `• Итого звёзд: <b>${starsNeeded} ⭐</b>\n\n` +
+      `📤 Отправьте <b>${starsNeeded} ⭐ звёзд</b> на аккаунт:\n` +
+      `<b>@${recipient}</b>\n\n` +
+      `📎 В комментарии укажите:\n` +
+      `<code>order_${order.id}</code>\n\n` +
+      `После подтверждения оплаты администратором вы получите доступ к товару.\n\n` +
+      `ID заказа: <code>${order.id}</code>`,
+      {
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url("⭐ Отправить звёзды", `https://t.me/${recipient}`)],
+          [Markup.button.callback("✅ Я отправил, жду подтверждения", `stars_sent_${order.id}`)],
+        ]).reply_markup,
+      }
     );
   });
 
-  // ─── Оплата Stars — подарком ─────────────────────────────────────────────
+  // ─── Оплата Stars подарками ───────────────────────────────────────────────
   bot.action(/^pay_stars_gift_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const productId = parseInt((ctx.match as RegExpMatchArray)[1]);
@@ -400,63 +432,113 @@ export function createBot() {
     const { id: telegramId, username, first_name } = ctx.from;
     await getOrCreateUser(telegramId, username, first_name);
 
-    const amount = parseFloat(product.price);
-    // Фиксированно 1400 звёзд подарком
-    const starsNeeded = GIFT_STARS_AMOUNT;
+    const amountRub = parseFloat(product.price);
+    const starsNeeded = calcStarsByGift(amountRub, FRAGMENT_RATE);
 
     const order = await createOrder({
       buyerTelegramId: telegramId,
       productId,
-      amount,
+      amount: amountRub,
       paymentMethod: "stars_gift",
     });
 
-    const recipient = STARS_RECIPIENT_USERNAME || "username_not_set";
+    const recipient = STARS_RECIPIENT_USERNAME || "администратору";
 
     await ctx.replyWithHTML(
-      `🎁 <b>Оплата звёздами (подарком)</b>\n\n` +
-      `📦 Товар: <b>${product.name}</b>\n` +
-      `💰 Сумма: <b>${formatMoney(amount)}</b>\n` +
-      `⭐ Подарком: <b>${starsNeeded} ⭐</b>\n\n` +
-      `🎁 Отправьте подарок на <b>${starsNeeded} ⭐</b> пользователю:\n` +
-      `<code>@${recipient}</code>\n\n` +
-      `❗ ID заказа: <code>${order.id}</code>\n` +
-      `(сообщите его администратору для подтверждения)\n\n` +
-      `После отправки нажмите кнопку ниже:`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback("✅ Я отправил подарок", `stars_sent_${order.id}`)],
-        [Markup.button.callback("❌ Отмена", "back_to_shop")],
-      ])
+      `🎁 <b>Оплата подарками (Stars)</b>\n\n` +
+      `Товар: <b>${product.name}</b>\n` +
+      `Цена: <b>${formatMoney(amountRub)}</b>\n\n` +
+      `📊 Расчёт с учётом комиссий:\n` +
+      `• Курс Fragment: <b>${FRAGMENT_RATE} ₽/⭐</b>\n` +
+      `• Комиссия Fragment: <b>7%</b>\n` +
+      `• Комиссия ТГ (конвертация подарков→⭐): <b>30%</b>\n` +
+      `• Итого звёзд в подарках: <b>${starsNeeded} ⭐</b>\n\n` +
+      `🎁 Отправьте подарки на сумму <b>${starsNeeded} ⭐</b> на аккаунт:\n` +
+      `<b>@${recipient}</b>\n\n` +
+      `📎 Подарки должны быть конвертируемые (с возможностью обмена на звёзды)\n\n` +
+      `ID заказа: <code>${order.id}</code>`,
+      {
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url("🎁 Отправить подарок", `https://t.me/${recipient}`)],
+          [Markup.button.callback("✅ Я отправил подарок", `stars_sent_${order.id}`)],
+        ]).reply_markup,
+      }
     );
   });
 
   // ─── Подтверждение отправки Stars ────────────────────────────────────────
   bot.action(/^stars_sent_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery("✅ Заявка отправлена администратору!");
     const orderId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const { id } = ctx.from;
 
-    // Оповещаем администраторов
+    const { id: telegramId, username, first_name } = ctx.from;
+
+    await ctx.reply(
+      `⏳ Ваша заявка на подтверждение оплаты отправлена.\n` +
+      `ID заказа: <code>${orderId}</code>\n\n` +
+      `Администратор проверит оплату и выдаст доступ.`,
+      { parse_mode: "HTML" }
+    );
+
+    // Уведомить администраторов
     for (const adminId of ADMIN_IDS) {
       try {
         await ctx.telegram.sendMessage(
           adminId,
-          `⭐ <b>Запрос на подтверждение Stars-оплаты</b>\n\n` +
-          `👤 Пользователь: <code>${id}</code>\n` +
-          `🆔 Заказ: #${orderId}\n\n` +
-          `Подтвердите: /admin_confirm_order ${orderId}`,
-          { parse_mode: "HTML" }
+          `💰 <b>Заявка на подтверждение Stars-оплаты!</b>\n\n` +
+          `👤 Пользователь: ${displayName(username, first_name)} (<code>${telegramId}</code>)\n` +
+          `🆔 Заказ: <code>${orderId}</code>\n\n` +
+          `Проверьте получение звёзд/подарков и подтвердите:`,
+          {
+            parse_mode: "HTML",
+            reply_markup: Markup.inlineKeyboard([
+              [Markup.button.callback("✅ Подтвердить оплату", `admin_confirm_order_${orderId}_${telegramId}`)],
+              [Markup.button.callback("❌ Отклонить", `admin_reject_order_${orderId}_${telegramId}`)],
+            ]).reply_markup,
+          }
         );
       } catch {
-        // Администратор недоступен
+        // администратор недоступен
       }
     }
+  });
 
-    await ctx.reply(
-      `✅ Запрос отправлен администратору!\n\n` +
-      `🆔 Номер заказа: #${orderId}\n\n` +
-      `Ожидайте подтверждения. Обычно это занимает до 24 часов.`
-    );
+  // ─── Подтверждение заказа администратором ────────────────────────────────
+  bot.action(/^admin_confirm_order_(\d+)_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("✅ Обрабатываем...");
+    const { id: adminTgId } = ctx.from;
+    if (!isAdmin(adminTgId)) return;
+
+    const orderId = parseInt((ctx.match as RegExpMatchArray)[1]);
+    const buyerTelegramId = parseInt((ctx.match as RegExpMatchArray)[2]);
+
+    await deliverOrder(ctx, orderId, buyerTelegramId);
+  });
+
+  bot.action(/^admin_reject_order_(\d+)_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("❌ Отклонено");
+    const { id: adminTgId } = ctx.from;
+    if (!isAdmin(adminTgId)) return;
+
+    const orderId = parseInt((ctx.match as RegExpMatchArray)[1]);
+    const buyerTelegramId = parseInt((ctx.match as RegExpMatchArray)[2]);
+
+    const { db } = await import("@/db");
+    const { orders: ordersTable } = await import("@/db/schema");
+    const { eq } = await import("drizzle-orm");
+    await db.update(ordersTable).set({ status: "failed" }).where(eq(ordersTable.id, orderId));
+
+    await ctx.reply(`❌ Заказ #${orderId} отклонён.`);
+
+    try {
+      await ctx.telegram.sendMessage(
+        buyerTelegramId,
+        `❌ <b>Ваш заказ #${orderId} был отклонён.</b>\n\nЕсли вы считаете, что произошла ошибка — обратитесь в поддержку.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // пользователь недоступен
+    }
   });
 
   // ─── /mylink ─────────────────────────────────────────────────────────────
@@ -466,7 +548,7 @@ export function createBot() {
 
     const link = await getReferralLink(id);
     if (!link) {
-      await ctx.reply("⚠️ Реферальная ссылка не найдена. Используйте /start");
+      await ctx.reply("⚠️ Реферальная ссылка не найдена. Используйте /start.");
       return;
     }
 
@@ -476,9 +558,9 @@ export function createBot() {
       `🔗 <b>Ваша реферальная ссылка</b>\n\n` +
         `<code>${refUrl}</code>\n\n` +
         `📊 <b>Статистика</b>\n` +
-        `👆 Кликов: <b>${link.clickCount}</b>\n` +
-        `👥 Перешло: <b>${link.referredCount}</b>\n\n` +
-        `💡 Делитесь ссылкой и зарабатывайте <b>10%</b> с покупок рефералов!`
+        `👆 Переходов: <b>${link.clickCount}</b>\n` +
+        `👥 Зарегистрировалось: <b>${link.referredCount}</b>\n\n` +
+        `💡 Делитесь ссылкой и зарабатывайте <b>50%</b> с каждой покупки реферала!`
     );
   });
 
@@ -492,17 +574,15 @@ export function createBot() {
       getEarningsByTelegramId(id),
     ]);
 
-    const refUrl = link
-      ? `https://t.me/${BOT_USERNAME}?start=${link.code}`
-      : "—";
+    const refUrl = link ? `https://t.me/${BOT_USERNAME}?start=${link.code}` : "—";
 
     await ctx.replyWithHTML(
       `📈 <b>Ваша статистика</b>\n\n` +
-        `🔗 Реф. ссылка: <code>${refUrl}</code>\n` +
-        `👥 Привлечено: <b>${link?.referredCount ?? 0}</b>\n` +
-        `👆 Кликов: <b>${link?.clickCount ?? 0}</b>\n\n` +
-        `💰 <b>Всего заработано: ${formatMoney(earned?.totalEarned ?? 0)}</b>\n\n` +
-        `ℹ️ Вы получаете 10% с каждой покупки ваших рефералов.`
+        `🔗 Ссылка: <code>${refUrl}</code>\n` +
+        `👥 Привели пользователей: <b>${link?.referredCount ?? 0}</b>\n` +
+        `👆 Переходов по ссылке: <b>${link?.clickCount ?? 0}</b>\n\n` +
+        `💰 <b>Заработано всего: ${formatMoney(earned?.totalEarned ?? 0)}</b>\n\n` +
+        `ℹ️ Вы получаете 50% с каждой покупки ваших рефералов.`
     );
   });
 
@@ -515,7 +595,7 @@ export function createBot() {
 
     if (top.length === 0) {
       await ctx.replyWithHTML(
-        "📊 <b>Топ участников</b>\n\nЗаработков пока нет. Будьте первым!"
+        "📊 <b>Топ участников</b>\n\nПока нет заработков. Будь первым!"
       );
       return;
     }
@@ -526,13 +606,12 @@ export function createBot() {
       text += `${MEDALS[i]} ${name} — <b>${formatMoney(row.totalEarned)}</b>\n`;
     });
 
-    text +=
-      "\n💡 Делитесь реферальной ссылкой (/mylink) и зарабатывайте!";
+    text += "\n💡 Поделитесь своей ссылкой (/mylink) и попадите в топ!";
 
     await ctx.replyWithHTML(text);
   });
 
-  // ─── /admin ───────────────────────────────────────────────────────────────
+  // ─── /admin ──────────────────────────────────────────────────────────────
   bot.command("admin", async (ctx) => {
     const { id } = ctx.from;
     if (!isAdmin(id)) {
@@ -542,123 +621,166 @@ export function createBot() {
 
     await ctx.replyWithHTML(
       "🔧 <b>Панель администратора</b>\n\n" +
-        "📦 Товары:\n" +
+        "📦 <b>Товары:</b>\n" +
         "/admin_products — список товаров\n" +
         "/admin_add_product — добавить товар\n\n" +
-        "🏷 Купоны:\n" +
-        "/admin_coupons — все купоны\n" +
-        "/admin_add_coupon — создать купон\n\n" +
-        "👥 Пользователи:\n" +
-        "/admin_users — все пользователи\n" +
-        "/admin_purchases — последние покупки\n" +
-        "/admin_orders — последние заказы\n\n" +
-        "📊 Статистика:\n" +
+        "📊 <b>Статистика:</b>\n" +
         "/admin_stats — общая статистика\n" +
-        "/admin_top — топ участников\n\n" +
-        "✅ Подтверждение:\n" +
-        "/admin_confirm_order [id] — подтвердить Stars-оплату\n"
+        "/admin_links — реферальные ссылки\n" +
+        "/admin_users — все пользователи\n" +
+        "/admin_orders — последние заказы\n" +
+        "/admin_purchases — покупки\n" +
+        "/admin_top — топ по заработку\n\n" +
+        "💰 <b>Ручная оплата:</b>\n" +
+        "/admin_add_purchase [userId] [сумма] [описание]\n\n" +
+        "⚙️ <b>Настройки:</b>\n" +
+        "/admin_set_stars_recipient — юзернейм для приёма звёзд\n" +
+        "/admin_set_fragment_rate — курс Fragment"
     );
     await logAction(id, ctx.from.username, "ADMIN_PANEL");
+  });
+
+  // ─── /admin_products ─────────────────────────────────────────────────────
+  bot.command("admin_products", async (ctx) => {
+    const { id } = ctx.from;
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
+
+    const prods = await getActiveProducts();
+    if (prods.length === 0) {
+      await ctx.replyWithHTML("📦 Товаров нет.\n\nДобавьте: /admin_add_product");
+      return;
+    }
+
+    let text = `📦 <b>Товары (${prods.length})</b>\n\n`;
+    for (const p of prods) {
+      text += `• [${p.id}] <b>${p.name}</b> — ${formatMoney(p.price)}\n`;
+      text += `  Тип: ${p.productType}`;
+      if (p.channelId) text += ` | Канал: <code>${p.channelId}</code>`;
+      text += "\n\n";
+    }
+
+    text += "Управление: /admin_edit_product [id] | /admin_del_product [id]";
+
+    await ctx.replyWithHTML(text);
+  });
+
+  // ─── /admin_add_product ──────────────────────────────────────────────────
+  bot.command("admin_add_product", async (ctx) => {
+    const { id } = ctx.from;
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
+
+    await setUserState(id, "admin_add_product_name");
+    await ctx.reply(
+      "📦 Добавление нового товара\n\n" +
+      "Шаг 1/4: Введите <b>название</b> товара:",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ─── /admin_del_product [id] ─────────────────────────────────────────────
+  bot.command("admin_del_product", async (ctx) => {
+    const { id } = ctx.from;
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
+
+    const parts = ctx.message.text.split(" ").slice(1);
+    const productId = parseInt(parts[0]);
+    if (isNaN(productId)) {
+      await ctx.reply("⚠️ Укажите ID товара: /admin_del_product [id]");
+      return;
+    }
+
+    await deleteProduct(productId);
+    await ctx.reply(`✅ Товар #${productId} деактивирован.`);
   });
 
   // ─── /admin_stats ─────────────────────────────────────────────────────────
   bot.command("admin_stats", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
     const stats = await getTotalStats();
 
     await ctx.replyWithHTML(
-      `📊 <b>Общая статистика</b>\n\n` +
+      `📊 <b>Общая статистика бота</b>\n\n` +
         `👥 Пользователей: <b>${stats.users}</b>\n` +
         `🔗 Реферальных ссылок: <b>${stats.links}</b>\n` +
-        `🛒 Покупок: <b>${stats.purchases}</b>\n` +
-        `💵 Выручка (покупки): <b>${formatMoney(stats.totalRevenue)}</b>\n` +
+        `🛒 Покупок (реф.): <b>${stats.purchases}</b>\n` +
         `✅ Оплаченных заказов: <b>${stats.paidOrders}</b>\n` +
         `💵 Выручка (заказы): <b>${formatMoney(stats.ordersRevenue)}</b>\n` +
-        `💸 Реф. комиссии (10%): <b>${formatMoney(stats.totalCommissions)}</b>\n` +
+        `💸 Комиссии выплачено: <b>${formatMoney(stats.totalCommissions)}</b>\n` +
         `📅 ${new Date().toLocaleString("ru-RU")}`
     );
     await logAction(id, ctx.from.username, "ADMIN_STATS");
   });
 
-  // ─── /admin_products ──────────────────────────────────────────────────────
-  bot.command("admin_products", async (ctx) => {
+  // ─── /admin_links ─────────────────────────────────────────────────────────
+  bot.command("admin_links", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
-    const prods = await getActiveProducts();
-    if (prods.length === 0) {
-      await ctx.reply("Товаров нет. /admin_add_product — добавить.");
+    const links = await getAllReferralLinksWithStats();
+    if (links.length === 0) {
+      await ctx.reply("Реферальных ссылок пока нет.");
       return;
     }
 
-    let text = `📦 <b>Товары (${prods.length})</b>\n\n`;
-    prods.forEach((p) => {
+    let text = `🔗 <b>Реферальные ссылки (${links.length})</b>\n\n`;
+    links.slice(0, 30).forEach((l, i) => {
+      const owner = displayName(l.ownerUsername, null);
+      const url = `https://t.me/${BOT_USERNAME}?start=${l.code}`;
       text +=
-        `🆔 #${p.id} — <b>${p.name}</b>\n` +
-        `💵 ${formatMoney(p.price)} | Тип: ${p.productType}\n` +
-        (p.channelId ? `📡 Канал: <code>${p.channelId}</code>\n` : "") +
-        `\n`;
+        `${i + 1}. ${owner} — код: <code>${l.code}</code>\n` +
+        `   👆 Переходов: ${l.clickCount} | 👥 Пришло: ${l.referredCount}\n\n`;
     });
 
-    text += `\nУдалить: /admin_delete_product [id]`;
-    await ctx.replyWithHTML(text);
-    await logAction(id, ctx.from.username, "ADMIN_PRODUCTS");
+    if (links.length > 30) text += `… и ещё ${links.length - 30}.`;
+
+    await ctx.replyWithHTML(text, { disable_web_page_preview: true } as never);
+    await logAction(id, ctx.from.username, "ADMIN_LINKS");
   });
 
-  // ─── /admin_add_product ───────────────────────────────────────────────────
-  bot.command("admin_add_product", async (ctx) => {
+  // ─── /admin_users ─────────────────────────────────────────────────────────
+  bot.command("admin_users", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
-    await setUserState(id, "admin_add_product_name", {});
-    await ctx.reply("Шаг 1/4: Введите <b>название</b> товара:", { parse_mode: "HTML" });
-  });
-
-  // ─── /admin_delete_product [id] ───────────────────────────────────────────
-  bot.command("admin_delete_product", async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    const parts = ctx.message.text.split(" ").slice(1);
-    const productId = parseInt(parts[0]);
-    if (isNaN(productId)) {
-      await ctx.reply("⚠️ Укажите ID: /admin_delete_product [id]");
+    const allUsers = await getAllUsers();
+    if (allUsers.length === 0) {
+      await ctx.reply("Пользователей пока нет.");
       return;
     }
-    await deleteProduct(productId);
-    await ctx.reply(`✅ Товар #${productId} деактивирован.`);
+
+    let text = `👥 <b>Все пользователи (${allUsers.length})</b>\n\n`;
+    allUsers.slice(0, 25).forEach((u, i) => {
+      const name = displayName(u.username, u.firstName);
+      const ref = u.referredBy ? `реф: ${u.referredBy}` : "органика";
+      text += `${i + 1}. ${name} <code>${u.telegramId}</code> (${ref})\n`;
+    });
+    if (allUsers.length > 25) text += `\n… и ещё ${allUsers.length - 25}.`;
+
+    await ctx.replyWithHTML(text);
+    await logAction(id, ctx.from.username, "ADMIN_USERS");
   });
 
   // ─── /admin_orders ────────────────────────────────────────────────────────
   bot.command("admin_orders", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
     const recent = await getRecentOrders(15);
     if (recent.length === 0) {
-      await ctx.reply("Заказов нет.");
+      await ctx.reply("Заказов пока нет.");
       return;
     }
 
-    let text = `📋 <b>Последние заказы (${recent.length})</b>\n\n`;
-    recent.forEach((o) => {
-      const methodEmoji: Record<string, string> = {
-        sbp: "💳",
-        card: "🏦",
-        cryptobot: "🪙",
-        stars_username: "⭐",
-        stars_gift: "🎁",
-      };
-      const emoji = methodEmoji[o.paymentMethod] ?? "💰";
+    let text = `🛒 <b>Последние заказы (${recent.length})</b>\n\n`;
+    for (const o of recent) {
+      const statusEmoji = o.status === "paid" ? "✅" : o.status === "pending" ? "⏳" : "❌";
       text +=
-        `#${o.id} ${emoji} ${o.paymentMethod.toUpperCase()}\n` +
-        `👤 <code>${o.buyerTelegramId}</code> — <b>${formatMoney(o.amount)}</b>\n` +
-        `📊 ${o.status}` +
-        (o.couponCode ? ` | 🏷 ${o.couponCode} -${o.discountPercent}%` : "") +
-        `\n\n`;
-    });
+        `${statusEmoji} #${o.id} | ${o.paymentMethod.toUpperCase()}\n` +
+        `👤 <code>${o.buyerTelegramId}</code> | 💵 ${formatMoney(o.amount)}\n` +
+        `📅 ${new Date(o.createdAt).toLocaleString("ru-RU")}\n\n`;
+    }
 
     await ctx.replyWithHTML(text);
   });
@@ -666,112 +788,83 @@ export function createBot() {
   // ─── /admin_purchases ─────────────────────────────────────────────────────
   bot.command("admin_purchases", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
     const recent = await getRecentPurchases(20);
     if (recent.length === 0) {
-      await ctx.reply("Покупок нет.");
+      await ctx.reply("Покупок пока нет.");
       return;
     }
 
     let text = `🛒 <b>Последние покупки (${recent.length})</b>\n\n`;
     recent.forEach((p) => {
       text +=
-        `👤 <code>${p.buyerTelegramId}</code>\n` +
-        `💵 ${formatMoney(p.amount)} | Комиссия: ${formatMoney(p.commission)}\n` +
-        (p.referrerTelegramId ? `🔗 Реф: <code>${p.referrerTelegramId}</code>\n` : "") +
+        `👤 Покупатель: <code>${p.buyerTelegramId}</code>\n` +
+        `💵 Сумма: <b>${formatMoney(p.amount)}</b> | Комиссия: <b>${formatMoney(p.commission)}</b>\n` +
+        (p.referrerTelegramId ? `🔗 Реферер: <code>${p.referrerTelegramId}</code>\n` : "") +
         (p.description ? `📝 ${p.description}\n` : "") +
         `📅 ${new Date(p.createdAt).toLocaleString("ru-RU")}\n\n`;
     });
 
     await ctx.replyWithHTML(text);
+    await logAction(id, ctx.from.username, "ADMIN_PURCHASES");
   });
 
-  // ─── /admin_links ─────────────────────────────────────────────────────────
-  bot.command("admin_links", async (ctx) => {
+  // ─── /admin_add_purchase ──────────────────────────────────────────────────
+  bot.command("admin_add_purchase", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
-    const links = await getAllReferralLinksWithStats();
-    if (links.length === 0) {
-      await ctx.reply("Реферальных ссылок нет.");
+    const parts = ctx.message.text.split(" ").slice(1);
+    const buyerId = parseInt(parts[0]);
+    const amount = parseFloat(parts[1]);
+    const desc = parts.slice(2).join(" ") || undefined;
+
+    if (isNaN(buyerId) || isNaN(amount) || amount <= 0) {
+      await ctx.reply(
+        "⚠️ Использование: /admin_add_purchase [telegramId] [сумма] [описание]\n" +
+          "Пример: /admin_add_purchase 123456789 500 Подписка Premium"
+      );
       return;
     }
 
-    let text = `🔗 <b>Все реф. ссылки (${links.length})</b>\n\n`;
-    links.slice(0, 30).forEach((l, i) => {
-      const owner = displayName(l.ownerUsername, null);
-      const url = `https://t.me/${BOT_USERNAME}?start=${l.code}`;
-      text +=
-        `${i + 1}. ${owner} — <code>${l.code}</code>\n` +
-        `   👆 ${l.clickCount} кликов | 👥 ${l.referredCount} перешло\n` +
-        `   🔗 <a href="${url}">${url}</a>\n\n`;
-    });
-
-    if (links.length > 30) text += `… и ещё ${links.length - 30}`;
-
-    await ctx.replyWithHTML(text, { disable_web_page_preview: true } as any);
-  });
-
-  // ─── /admin_users ─────────────────────────────────────────────────────────
-  bot.command("admin_users", async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    const allUsers = await getAllUsers();
-    if (allUsers.length === 0) {
-      await ctx.reply("Пользователей нет.");
+    const buyer = await getUserByTelegramId(buyerId);
+    if (!buyer) {
+      await ctx.reply(`⚠️ Пользователь ${buyerId} не найден в базе.`);
       return;
     }
 
-    let text = `👥 <b>Все пользователи (${allUsers.length})</b>\n\n`;
-    allUsers.slice(0, 20).forEach((u, i) => {
-      const name = displayName(u.username, u.firstName);
-      const ref = u.referredBy ? `реф: ${u.referredBy}` : "органик";
-      text += `${i + 1}. ${name} <code>${u.telegramId}</code> (${ref})\n`;
-      text += `   /user_${u.telegramId}\n`;
-    });
+    const { commission, referrerTelegramId } = await recordPurchase(buyerId, amount, desc);
 
-    if (allUsers.length > 20) text += `\n… и ещё ${allUsers.length - 20}`;
+    let msg =
+      `✅ <b>Покупка записана!</b>\n\n` +
+      `👤 Покупатель: ${displayName(buyer.username, buyer.firstName)} (<code>${buyerId}</code>)\n` +
+      `💵 Сумма: <b>${formatMoney(amount)}</b>\n` +
+      `💸 Комиссия (50%): <b>${formatMoney(commission)}</b>\n`;
 
-    await ctx.replyWithHTML(text);
-    await logAction(id, ctx.from.username, "ADMIN_USERS");
-  });
+    if (referrerTelegramId) {
+      const referrer = await getUserByTelegramId(referrerTelegramId);
+      const rName = displayName(referrer?.username, referrer?.firstName);
+      msg += `🔗 Начислено рефереру: ${rName} (<code>${referrerTelegramId}</code>)`;
 
-  // ─── /user_[id] — детали пользователя ────────────────────────────────────
-  bot.hears(/^\/user_(\d+)$/, async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    const telegramId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    const stats = await getUserDetailedStats(telegramId);
-
-    if (!stats) {
-      await ctx.reply(`❌ Пользователь ${telegramId} не найден.`);
-      return;
+      try {
+        await ctx.telegram.sendMessage(
+          referrerTelegramId,
+          `🎉 <b>Вы получили комиссию!</b>\n\n` +
+            `Ваш реферал ${displayName(buyer.username, buyer.firstName)} сделал покупку на <b>${formatMoney(amount)}</b>.\n` +
+            `💰 Ваша комиссия (50%): <b>${formatMoney(commission)}</b>\n\n` +
+            `Используйте /mystats чтобы увидеть общий заработок!`,
+          { parse_mode: "HTML" }
+        );
+      } catch {
+        // реферер не запустил бота
+      }
+    } else {
+      msg += `ℹ️ Реферера нет — органический пользователь.`;
     }
 
-    const { user, link, totalEarned, refPurchases, refRevenue, ownOrders, ownOrdersTotal } = stats;
-    const name = displayName(user.username, user.firstName);
-    const refUrl = link ? `https://t.me/${BOT_USERNAME}?start=${link.code}` : "—";
-
-    await ctx.replyWithHTML(
-      `👤 <b>Пользователь: ${name}</b>\n` +
-      `🆔 Telegram ID: <code>${telegramId}</code>\n` +
-      (user.username ? `📛 Username: @${user.username}\n` : "") +
-      `📅 Зарегистрирован: ${new Date(user.joinedAt).toLocaleString("ru-RU")}\n` +
-      (user.referredBy ? `🔗 Пришёл от: <code>${user.referredBy}</code>\n` : "") +
-      `\n` +
-      `🔗 <b>Реферальная ссылка:</b>\n<code>${refUrl}</code>\n` +
-      `👆 Кликов: <b>${link?.clickCount ?? 0}</b>\n` +
-      `👥 Привлёк: <b>${link?.referredCount ?? 0}</b>\n` +
-      `\n` +
-      `📊 <b>Статистика покупок:</b>\n` +
-      `🛒 Его покупок оплачено: <b>${ownOrders}</b> (${formatMoney(ownOrdersTotal)})\n` +
-      `🎯 Покупок через его реф. ссылку: <b>${refPurchases}</b>\n` +
-      `💰 Сумма рефер. покупок: <b>${formatMoney(refRevenue)}</b>\n` +
-      `💸 Заработано реф. комиссий: <b>${formatMoney(totalEarned)}</b>`
-    );
+    await ctx.replyWithHTML(msg);
+    await logAction(id, ctx.from.username, "ADMIN_ADD_PURCHASE", `buyer=${buyerId} amount=${amount}`);
   });
 
   // ─── /admin_top ───────────────────────────────────────────────────────────
@@ -798,7 +891,7 @@ export function createBot() {
   // ─── /admin_confirm_order [orderId] ──────────────────────────────────────
   bot.command("admin_confirm_order", async (ctx) => {
     const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
+    if (!isAdmin(id)) return ctx.reply("⛔ Доступ запрещён.");
 
     const parts = ctx.message.text.split(" ").slice(1);
     const orderId = parseInt(parts[0]);
@@ -807,11 +900,11 @@ export function createBot() {
       return;
     }
 
-    const { db: dbInst } = await import("@/db");
+    const { db } = await import("@/db");
     const { orders: ordersTable } = await import("@/db/schema");
     const { eq } = await import("drizzle-orm");
 
-    const orderRows = await dbInst.select().from(ordersTable).where(eq(ordersTable.id, orderId)).limit(1);
+    const orderRows = await db.select().from(ordersTable).where(eq(ordersTable.id, orderId)).limit(1);
     if (!orderRows[0]) {
       await ctx.reply(`❌ Заказ #${orderId} не найден.`);
       return;
@@ -820,67 +913,25 @@ export function createBot() {
     await deliverOrder(ctx, orderId, orderRows[0].buyerTelegramId);
   });
 
-  // ─── /admin_coupons ───────────────────────────────────────────────────────
-  bot.command("admin_coupons", async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    const allCoupons = await getAllCoupons();
-    if (allCoupons.length === 0) {
-      await ctx.reply("Купонов нет. /admin_add_coupon — создать.");
-      return;
-    }
-
-    let text = `🏷 <b>Все купоны (${allCoupons.length})</b>\n\n`;
-    allCoupons.forEach((c) => {
-      const status = c.isActive ? "✅" : "❌";
-      const limit = c.usageLimit > 0 ? `${c.usageCount}/${c.usageLimit}` : `${c.usageCount}/∞`;
-      const expires = c.expiresAt ? `до ${new Date(c.expiresAt).toLocaleDateString("ru-RU")}` : "бессрочно";
-      text +=
-        `${status} <code>${c.code}</code> — <b>-${c.discountPercent}%</b>\n` +
-        `   Использований: ${limit} | ${expires}\n` +
-        (c.isActive ? `   Деактивировать: /admin_deactivate_coupon_${c.id}\n` : "") +
-        `\n`;
-    });
-
-    await ctx.replyWithHTML(text);
-  });
-
-  // ─── /admin_add_coupon ────────────────────────────────────────────────────
-  bot.command("admin_add_coupon", async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    await setUserState(id, "admin_add_coupon_code", {});
-    await ctx.reply(
-      "🏷 Создание купона\n\nШаг 1/3: Введите <b>код купона</b> (латиницей, например: SUMMER20):",
-      { parse_mode: "HTML" }
-    );
-  });
-
-  // ─── /admin_deactivate_coupon_[id] ────────────────────────────────────────
-  bot.hears(/^\/admin_deactivate_coupon_(\d+)$/, async (ctx) => {
-    const { id } = ctx.from;
-    if (!isAdmin(id)) { await ctx.reply("⛔ Доступ запрещён."); return; }
-
-    const couponId = parseInt((ctx.match as RegExpMatchArray)[1]);
-    await deactivateCoupon(couponId);
-    await ctx.reply(`✅ Купон #${couponId} деактивирован.`);
-  });
-
   // ─── FSM — обработка текстовых сообщений ─────────────────────────────────
   bot.on("text", async (ctx) => {
     const { id, username, first_name } = ctx.from;
 
+    // Если начинается с команды — пропускаем
     if (ctx.message.text.startsWith("/")) {
       if (!isAdmin(id)) {
-        await ctx.reply("❓ Неизвестная команда.\n/shop /mylink /mystats /statistics");
+        await ctx.reply(
+          "❓ Неизвестная команда.\n/shop /mylink /mystats /statistics"
+        );
       } else {
-        await ctx.reply("❓ Неизвестная команда.\nИспользуйте /admin для списка команд.");
+        await ctx.reply(
+          "❓ Неизвестная команда.\nИспользуйте /admin для списка команд."
+        );
       }
       return;
     }
 
+    // Проверяем состояние FSM
     const stateRow = await getUserState(id);
     if (!stateRow) return;
 
@@ -888,48 +939,12 @@ export function createBot() {
     const data = (stateRow.data as Record<string, unknown>) ?? {};
     const text = ctx.message.text.trim();
 
-    // ─── Применение купона ────────────────────────────────────────────────
-    if (state === "apply_coupon") {
-      const productId = data.productId as number;
-      const result = await validateCoupon(text);
-
-      if (!result.valid || !result.coupon) {
-        await clearUserState(id);
-        await ctx.reply(`❌ ${result.error ?? "Купон недействителен"}.\n\nПопробуйте снова или вернитесь в /shop`);
-        return;
-      }
-
-      const coupon = result.coupon;
-      const product = await getProductById(productId);
-      if (!product) { await clearUserState(id); return; }
-
-      const originalPrice = parseFloat(product.price);
-      const discountedPrice = +(originalPrice * (1 - coupon.discountPercent / 100)).toFixed(2);
-
-      await clearUserState(id);
-      await ctx.replyWithHTML(
-        `✅ <b>Купон применён!</b>\n\n` +
-        `🏷 Код: <code>${coupon.code}</code>\n` +
-        `💸 Скидка: <b>${coupon.discountPercent}%</b>\n` +
-        `💰 Было: <b>${formatMoney(originalPrice)}</b>\n` +
-        `💚 Стало: <b>${formatMoney(discountedPrice)}</b>\n\n` +
-        `Выберите способ оплаты:`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback("💳 СБП (+10%)", `pay_sbp_coupon_${productId}_${coupon.code}`)],
-          [Markup.button.callback("🏦 Карта (+10%)", `pay_card_coupon_${productId}_${coupon.code}`)],
-          [Markup.button.callback("🪙 CryptoBot", `pay_crypto_coupon_${productId}_${coupon.code}`)],
-          [Markup.button.callback("◀️ Назад", "back_to_shop")],
-        ])
-      );
-      return;
-    }
-
-    // ─── Добавление товара ────────────────────────────────────────────────
+    // ─── Добавление товара — многошаговый FSM ────────────────────────────
     if (state === "admin_add_product_name") {
       if (!isAdmin(id)) { await clearUserState(id); return; }
       data.name = text;
       await setUserState(id, "admin_add_product_desc", data);
-      await ctx.reply("Шаг 2/4: Введите <b>описание</b> (или «-» пропустить):", { parse_mode: "HTML" });
+      await ctx.reply("Шаг 2/4: Введите <b>описание</b> товара (или напишите «-» чтобы пропустить):", { parse_mode: "HTML" });
       return;
     }
 
@@ -945,15 +960,15 @@ export function createBot() {
       if (!isAdmin(id)) { await clearUserState(id); return; }
       const price = parseFloat(text.replace(",", "."));
       if (isNaN(price) || price <= 0) {
-        await ctx.reply("⚠️ Введите корректную цену, например: 1500");
+        await ctx.reply("⚠️ Введите корректную цену числом, например: 1500");
         return;
       }
       data.price = price;
       await setUserState(id, "admin_add_product_channel", data);
       await ctx.reply(
-        "Шаг 4/4: Введите <b>ID канала/группы</b> для выдачи ссылки.\n" +
+        "Шаг 4/4: Введите <b>ID канала/группы</b> для выдачи ссылки после оплаты.\n" +
         "Например: <code>-1001234567890</code>\n\n" +
-        "Или напишите «-» для цифрового контента:",
+        "Или напишите «-» если товар цифровой (текст/инструкция):",
         { parse_mode: "HTML" }
       );
       return;
@@ -962,21 +977,31 @@ export function createBot() {
     if (state === "admin_add_product_channel") {
       if (!isAdmin(id)) { await clearUserState(id); return; }
 
+      let productType = "invite_link";
+      let channelId: string | undefined;
+      let digitalContent: string | undefined;
+
       if (text === "-") {
+        productType = "digital";
+        await clearUserState(id);
         await setUserState(id, "admin_add_product_digital", data);
         await ctx.reply(
-          "Введите <b>цифровой контент</b> (текст, который получит покупатель):",
+          "Введите <b>цифровой контент</b> (текст, который получит пользователь после оплаты):",
           { parse_mode: "HTML" }
         );
         return;
       } else {
-        const channelId = text;
+        channelId = text;
+        data.channelId = channelId;
+        data.productType = productType;
+
         const product = await createProduct({
           name: data.name as string,
-          description: data.description as string | null,
+          description: data.description as string | undefined,
           price: data.price as number,
-          productType: "invite_link",
+          productType,
           channelId,
+          digitalContent,
         });
 
         await clearUserState(id);
@@ -986,8 +1011,8 @@ export function createBot() {
           `📦 Название: <b>${product.name}</b>\n` +
           `💵 Цена: <b>${formatMoney(product.price)}</b>\n` +
           `📡 Канал: <code>${channelId}</code>\n\n` +
-          `⚠️ Убедитесь, что бот является администратором в канале!\n\n` +
-          `Список: /admin_products`
+          `⚠️ Убедитесь, что бот является <b>администратором</b> в канале <code>${channelId}</code>!\n\n` +
+          `Список товаров: /admin_products`
         );
       }
       return;
@@ -997,7 +1022,7 @@ export function createBot() {
       if (!isAdmin(id)) { await clearUserState(id); return; }
       const product = await createProduct({
         name: data.name as string,
-        description: data.description as string | null,
+        description: data.description as string | undefined,
         price: data.price as number,
         productType: "digital",
         digitalContent: text,
@@ -1010,263 +1035,13 @@ export function createBot() {
         `📦 Название: <b>${product.name}</b>\n` +
         `💵 Цена: <b>${formatMoney(product.price)}</b>\n` +
         `📝 Тип: Цифровой контент\n\n` +
-        `Список: /admin_products`
-      );
-      return;
-    }
-
-    // ─── Создание купона ──────────────────────────────────────────────────
-    if (state === "admin_add_coupon_code") {
-      if (!isAdmin(id)) { await clearUserState(id); return; }
-      const code = text.toUpperCase().replace(/\s+/g, "");
-      if (!/^[A-Z0-9_-]{2,20}$/.test(code)) {
-        await ctx.reply("⚠️ Код должен содержать латинские буквы и цифры, 2-20 символов.");
-        return;
-      }
-      data.couponCode = code;
-      await setUserState(id, "admin_add_coupon_discount", data);
-      await ctx.reply("Шаг 2/3: Введите <b>% скидки</b> (например: 20):", { parse_mode: "HTML" });
-      return;
-    }
-
-    if (state === "admin_add_coupon_discount") {
-      if (!isAdmin(id)) { await clearUserState(id); return; }
-      const discount = parseInt(text);
-      if (isNaN(discount) || discount < 1 || discount > 100) {
-        await ctx.reply("⚠️ Введите число от 1 до 100");
-        return;
-      }
-      data.discount = discount;
-      await setUserState(id, "admin_add_coupon_limit", data);
-      await ctx.reply(
-        "Шаг 3/3: Введите <b>лимит использований</b> (0 = безлимитный):",
-        { parse_mode: "HTML" }
-      );
-      return;
-    }
-
-    if (state === "admin_add_coupon_limit") {
-      if (!isAdmin(id)) { await clearUserState(id); return; }
-      const limit = parseInt(text);
-      if (isNaN(limit) || limit < 0) {
-        await ctx.reply("⚠️ Введите число 0 или больше");
-        return;
-      }
-
-      const coupon = await createCoupon({
-        code: data.couponCode as string,
-        discountPercent: data.discount as number,
-        usageLimit: limit,
-      });
-
-      await clearUserState(id);
-      await ctx.replyWithHTML(
-        `✅ <b>Купон создан!</b>\n\n` +
-        `🏷 Код: <code>${coupon.code}</code>\n` +
-        `💸 Скидка: <b>${coupon.discountPercent}%</b>\n` +
-        `🔢 Лимит: <b>${coupon.usageLimit === 0 ? "∞" : coupon.usageLimit}</b>\n\n` +
-        `Все купоны: /admin_coupons`
+        `Список товаров: /admin_products`
       );
       return;
     }
   });
 
   return bot;
-}
-
-// ─── Вспомогательная функция для инициации платежей ─────────────────────────
-
-async function initiatePayment(
-  ctx: Context,
-  productId: number,
-  method: "sbp" | "card" | "cryptobot",
-  couponCode?: string
-) {
-  const PLATEGA_MERCHANT_ID = process.env.PLATEGA_MERCHANT_ID ?? "";
-  const PLATEGA_SECRET_KEY = process.env.PLATEGA_SECRET_KEY ?? "";
-  const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL ?? "";
-  const CRYPTOBOT_TOKEN = process.env.CRYPTOBOT_TOKEN ?? "";
-  const USD_TO_RUB = parseFloat(process.env.USD_TO_RUB_RATE ?? "90");
-  const BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME ?? "myrefbot";
-
-  const product = await getProductById(productId);
-  if (!product) return;
-
-  const { id: telegramId, username, first_name } = ctx.from!;
-  await getOrCreateUser(telegramId, username, first_name);
-
-  let baseAmount = parseFloat(product.price);
-  let discountPercent = 0;
-
-  // Применить купон
-  if (couponCode) {
-    const result = await validateCoupon(couponCode);
-    if (result.valid && result.coupon) {
-      discountPercent = result.coupon.discountPercent;
-      baseAmount = +(baseAmount * (1 - discountPercent / 100)).toFixed(2);
-    }
-  }
-
-  let finalAmount = baseAmount;
-  let amountLabel = formatMoney(baseAmount);
-
-  // Для СБП и карты — добавляем 10% комиссию Platega
-  if (method === "sbp" || method === "card") {
-    finalAmount = calcAmountWithCommission(baseAmount);
-    amountLabel = `${formatMoney(baseAmount)} + 10% = ${formatMoney(finalAmount)}`;
-  }
-
-  const order = await createOrder({
-    buyerTelegramId: telegramId,
-    productId,
-    amount: baseAmount,
-    paymentMethod: method,
-    couponCode,
-    discountPercent,
-  });
-
-  if (method === "sbp" || method === "card") {
-    if (!PLATEGA_MERCHANT_ID) {
-      await ctx.replyWithHTML(
-        `💳 <b>Оплата через ${method === "sbp" ? "СБП" : "карту"}</b>\n\n` +
-        `Товар: <b>${product.name}</b>\n` +
-        `Сумма к оплате: <b>${formatMoney(finalAmount)}</b>\n` +
-        (couponCode ? `🏷 Купон: <code>${couponCode}</code> (-${discountPercent}%)\n` : "") +
-        `\n⚠️ Platega не настроена. ID заказа: <code>${order.id}</code>`
-      );
-      return;
-    }
-
-    // Создаём платёж через Platega
-    const methodId = method === "sbp" ? 2 : 1;
-    const { v4: uuidv4 } = await import("uuid");
-    const txId = uuidv4();
-
-    const body: Record<string, unknown> = {
-      id: txId,
-      merchant_id: PLATEGA_MERCHANT_ID,
-      payment_method: methodId,
-      payment_details: { amount: finalAmount, currency: "RUB" },
-      description: `Оплата товара: ${product.name}`,
-      return_url: `https://t.me/${BOT_USERNAME}`,
-      failed_url: `https://t.me/${BOT_USERNAME}`,
-      webhook_url: `${WEBHOOK_BASE_URL}/api/payment/platega`,
-      order_id: `order_${order.id}`,
-    };
-
-    const crypto = await import("crypto");
-    const sign = crypto
-      .createHmac("sha256", PLATEGA_SECRET_KEY)
-      .update(JSON.stringify(body))
-      .digest("hex");
-
-    let paymentUrl = "";
-    try {
-      const res = await import("axios").then((m) =>
-        m.default.post("https://api.platega.io/v1/transaction/create", body, {
-          headers: {
-            "Content-Type": "application/json",
-            "X-Merchant-ID": PLATEGA_MERCHANT_ID,
-            "X-Signature": sign,
-          },
-        })
-      );
-      paymentUrl = res.data.redirect ?? res.data.payment_url ?? res.data.url ?? "";
-
-      // Сохраняем external ID
-      const { db } = await import("@/db");
-      const { orders: ordersTable } = await import("@/db/schema");
-      const { eq } = await import("drizzle-orm");
-      await db.update(ordersTable).set({ externalPaymentId: txId }).where(eq(ordersTable.id, order.id));
-    } catch (e) {
-      console.error("Platega error:", e);
-      await ctx.reply("❌ Ошибка создания платежа. Попробуйте позже.");
-      return;
-    }
-
-    if (!paymentUrl) {
-      await ctx.reply("❌ Не удалось получить ссылку на оплату. Попробуйте позже.");
-      return;
-    }
-
-    const emoji = method === "sbp" ? "💳" : "🏦";
-    const label = method === "sbp" ? "СБП" : "банковской картой";
-
-    await ctx.replyWithHTML(
-      `${emoji} <b>Оплата ${label}</b>\n\n` +
-      `📦 Товар: <b>${product.name}</b>\n` +
-      (couponCode ? `🏷 Купон: <code>${couponCode}</code> (-${discountPercent}%)\n` : "") +
-      `💰 Сумма: <b>${amountLabel}</b>\n\n` +
-      `Нажмите кнопку ниже для оплаты:`,
-      Markup.inlineKeyboard([
-        [Markup.button.url(`${emoji} Оплатить ${label}`, paymentUrl)],
-      ])
-    );
-  } else if (method === "cryptobot") {
-    if (!CRYPTOBOT_TOKEN) {
-      await ctx.replyWithHTML(
-        `🪙 <b>Оплата CryptoBot</b>\n\n` +
-        `Товар: <b>${product.name}</b>\n` +
-        `Сумма: <b>${formatMoney(baseAmount)}</b>\n` +
-        `\n⚠️ CryptoBot не настроен. ID заказа: <code>${order.id}</code>`
-      );
-      return;
-    }
-
-    // Конвертируем рубли в USDT
-    const amountUsdt = +(baseAmount / USD_TO_RUB).toFixed(2);
-
-    const invoice = await (async () => {
-      try {
-        const res = await import("axios").then((m) =>
-          m.default.post(
-            "https://pay.crypt.bot/api/createInvoice",
-            {
-              asset: "USDT",
-              amount: amountUsdt.toString(),
-              description: `Оплата товара: ${product.name}`,
-              payload: `order_${order.id}`,
-              paid_btn_name: "callback",
-              paid_btn_url: `${WEBHOOK_BASE_URL}/api/payment/cryptobot`,
-            },
-            { headers: { "Crypto-Pay-API-Token": CRYPTOBOT_TOKEN } }
-          )
-        );
-        const inv = res.data.result;
-        return { invoiceUrl: inv.pay_url, invoiceId: String(inv.invoice_id) };
-      } catch (e) {
-        console.error("CryptoBot error:", e);
-        return null;
-      }
-    })();
-
-    if (!invoice) {
-      await ctx.reply("❌ Ошибка создания платежа CryptoBot. Попробуйте позже.");
-      return;
-    }
-
-    const { db } = await import("@/db");
-    const { orders: ordersTable } = await import("@/db/schema");
-    const { eq } = await import("drizzle-orm");
-    await db.update(ordersTable).set({ externalPaymentId: invoice.invoiceId }).where(eq(ordersTable.id, order.id));
-
-    await ctx.replyWithHTML(
-      `🪙 <b>Оплата CryptoBot</b>\n\n` +
-      `📦 Товар: <b>${product.name}</b>\n` +
-      (couponCode ? `🏷 Купон: <code>${couponCode}</code> (-${discountPercent}%)\n` : "") +
-      `💰 Сумма: <b>${formatMoney(baseAmount)}</b>\n` +
-      `💎 USDT: <b>${amountUsdt} USDT</b>\n\n` +
-      `Нажмите кнопку для оплаты:`,
-      Markup.inlineKeyboard([
-        [Markup.button.url("🪙 Оплатить через CryptoBot", invoice.invoiceUrl)],
-      ])
-    );
-  }
-
-  // Применяем купон (увеличиваем счётчик)
-  if (couponCode && discountPercent > 0) {
-    await useCoupon(couponCode);
-  }
 }
 
 // ─── Выдача товара после оплаты ──────────────────────────────────────────────
@@ -1279,14 +1054,7 @@ export async function deliverOrder(
   const { db } = await import("@/db");
   const { orders: ordersTable } = await import("@/db/schema");
   const { eq } = await import("drizzle-orm");
-  const {
-    markOrderPaid,
-    getProductById,
-    recordPurchase,
-    getUserByTelegramId,
-    displayName: dispName,
-    formatMoney: fmtMoney,
-  } = await import("./helpers");
+  const { markOrderPaid, getProductById, recordPurchase, getUserByTelegramId, displayName, formatMoney } = await import("./helpers");
 
   const orderRows = await db.select().from(ordersTable).where(eq(ordersTable.id, orderId)).limit(1);
   const order = orderRows[0];
@@ -1311,10 +1079,14 @@ export async function deliverOrder(
 
   if (product.productType === "invite_link" && product.channelId) {
     try {
-      const inviteLink = await ctx.telegram.createChatInviteLink(product.channelId, {
-        creates_join_request: false,
-        member_limit: 1,
-      });
+      // Создаём одноразовую ссылку в канал
+      const inviteLink = await ctx.telegram.createChatInviteLink(
+        product.channelId,
+        {
+          creates_join_request: false,
+          member_limit: 1,
+        }
+      );
       deliveredContent = inviteLink.invite_link;
     } catch (e) {
       console.error("Ошибка создания ссылки:", e);
@@ -1325,8 +1097,11 @@ export async function deliverOrder(
   }
 
   await markOrderPaid(orderId, deliveredContent);
+
+  // Записать покупку для реферальной системы
   await recordPurchase(buyerTelegramId, parseFloat(order.amount), product.name);
 
+  // Отправить товар покупателю
   try {
     if (product.productType === "invite_link") {
       await ctx.telegram.sendMessage(
@@ -1334,7 +1109,7 @@ export async function deliverOrder(
         `✅ <b>Оплата подтверждена!</b>\n\n` +
         `📦 Товар: <b>${product.name}</b>\n\n` +
         `🔗 Ваша одноразовая ссылка:\n${deliveredContent}\n\n` +
-        `⚠️ Ссылка одноразовая — не передавайте её!`,
+        `⚠️ Ссылка одноразовая — не передавайте её другим!`,
         { parse_mode: "HTML" }
       );
     } else {
@@ -1347,29 +1122,34 @@ export async function deliverOrder(
       );
     }
   } catch (e) {
-    console.error("Ошибка отправки товара:", e);
+    console.error("Ошибка отправки товара покупателю:", e);
   }
 
+  // Уведомить администратора об успешной выдаче
   await ctx.reply(
     `✅ Заказ #${orderId} выполнен.\n` +
     `Пользователю <code>${buyerTelegramId}</code> отправлен товар «${product.name}».`,
     { parse_mode: "HTML" }
   );
 
+  // Реферальное уведомление
   const buyer = await getUserByTelegramId(buyerTelegramId);
   if (buyer?.referredBy) {
-    const commission = parseFloat(order.amount) * 0.1;
-    try {
-      await ctx.telegram.sendMessage(
-        buyer.referredBy,
-        `🎉 <b>Вы получили реферальную комиссию!</b>\n\n` +
-        `Ваш реферал ${dispName(buyer.username, buyer.firstName)} купил «${product.name}».\n` +
-        `💰 Ваша комиссия (10%): <b>${fmtMoney(commission)}</b>\n\n` +
-        `/mystats — ваш заработок`,
-        { parse_mode: "HTML" }
-      );
-    } catch {
-      // реферер недоступен
+    const referrer = await getUserByTelegramId(buyer.referredBy);
+    if (referrer) {
+      const commission = parseFloat(order.amount) * 0.5;
+      try {
+        await ctx.telegram.sendMessage(
+          buyer.referredBy,
+          `🎉 <b>Вы получили комиссию!</b>\n\n` +
+          `Ваш реферал ${displayName(buyer.username, buyer.firstName)} купил «${product.name}».\n` +
+          `💰 Ваша комиссия (50%): <b>${formatMoney(commission)}</b>\n\n` +
+          `/mystats — ваш заработок`,
+          { parse_mode: "HTML" }
+        );
+      } catch {
+        // реферер недоступен
+      }
     }
   }
 }

@@ -9,16 +9,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@types/uuid": "^10.0.0",
+    "@types/node-telegram-bot-api": "^0.64.15",
     "axios": "^1.18.1",
     "dotenv": "17.3.1",
     "drizzle-orm": "0.45.2",
     "next": "16.2.6",
+    "node-telegram-bot-api": "^1.1.2",
     "pg": "8.20.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "telegraf": "^4.16.3",
-    "uuid": "^14.0.1"
+    "telegraf": "^4.16.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.1.17",
